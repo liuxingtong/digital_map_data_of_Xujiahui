@@ -1,0 +1,29 @@
+# 街景 OSM 可视化依赖
+# 安装: pip install -r requirements_visualization.txt
+
+pandas>=1.5.0
+numpy>=1.21.0
+folium>=0.14.0
+
+# 仪表盘（统一网站）
+streamlit>=1.28.0
+streamlit-folium>=0.15.0
+plotly>=5.0.0
+
+# 高阶分析（KDE、等值线）
+scipy>=1.9.0
+matplotlib>=3.5.0
+
+# 人口模块
+rasterio>=1.3.0
+
+# 路网模块
+osmnx>=2.0.0
+networkx>=3.0
+openpyxl>=3.0
+
+# 用地模块（OSM 多边形）
+geopandas>=0.12.0
+
+# 坐标系转换（UTM、面积/距离分析）
+pyproj>=3.5.0
