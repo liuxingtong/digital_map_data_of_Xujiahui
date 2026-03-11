@@ -59,6 +59,7 @@ from analysis.road import (
     compute_intersection_density,
     compute_road_summary_stats,
     create_road_map,
+    run_cld_pipeline,
     XUJIAHUI_BOUNDS as ROAD_BOUNDS,
 )
 from analysis.house import (
@@ -75,6 +76,8 @@ from analysis.landuse import (
     create_landuse_map,
     prepare_landuse_for_viz,
     get_landuse_stats,
+    compute_landuse_advanced_metrics,
+    compute_landuse_grid_metrics,
     LANDUSE_LABELS,
     XUJIAHUI_BOUNDS as LANDUSE_BOUNDS,
 )
@@ -86,6 +89,8 @@ POI_DIR = (ROOT / "poi_data").resolve()
 ROAD_DIR = (ROOT / "road").resolve()
 HOUSE_DIR = (ROOT / "house_data").resolve()
 LANDUSE_DIR = (ROOT / "landuse_data").resolve()
+CACHE_DIR = (ROOT / "cache").resolve()
+CLD_CACHE_PATH = CACHE_DIR / "cld_priority.pkl"
 
 
 def _resolve_population_path(filename: str) -> Path:
@@ -97,6 +102,31 @@ def _resolve_population_path(filename: str) -> Path:
     if fallback.exists():
         return fallback.resolve()
     return p  # 返回原路径，由调用方处理不存在的情况
+
+
+def _load_cld_cache() -> tuple | None:
+    """从本地加载适老化改造优先级缓存，返回 (G, df_prio) 或 None。"""
+    if not CLD_CACHE_PATH.exists():
+        return None
+    try:
+        import pickle
+        with open(CLD_CACHE_PATH, "rb") as f:
+            return pickle.load(f)
+    except Exception:
+        return None
+
+
+def _save_cld_cache(G, df_prio) -> None:
+    """将适老化改造优先级结果保存到本地缓存。"""
+    if G is None:
+        return
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        import pickle
+        with open(CLD_CACHE_PATH, "wb") as f:
+            pickle.dump((G, df_prio), f)
+    except Exception:
+        pass
 
 
 def _resolve_poi_path(filename: str) -> Path:
@@ -297,6 +327,13 @@ def cached_load_landuse():
 
 
 @st.cache_data(ttl=3600)
+def cached_landuse_grid_metrics(data_dir: Path):
+    """加载用地并计算网格指标（Shannon、绿地率、混合用途）。"""
+    gdf, _ = load_landuse(data_dir, format="geojson")
+    return compute_landuse_grid_metrics(gdf)
+
+
+@st.cache_data(ttl=3600)
 def cached_load_road_network(with_coords: bool = True):
     """加载路网：优先 Excel，不存在则用 OSMnx 从 OpenStreetMap 下载。"""
     excel_path = ROAD_DIR / "Xuhui_Road_Network_Data_Fixed.xlsx"
@@ -327,7 +364,7 @@ st.markdown(
 # ==================== 模块选择 ====================
 module = st.radio(
     "当前模块",
-    ["📊 街景指标", "👥 人口分布", "📍 POI 分布", "🏠 房价小区", "🗺️ 用地类型", "🛣️ 路网"],
+    ["📊 街景指标", "👥 人口分布", "📍 POI 分布", "🏠 房价小区", "🗺️ 用地类型", "🛣️ 路网", "🔧 适老化改造优先级", "📐 CLD 回路"],
     horizontal=True,
     key="module",
 )
@@ -467,14 +504,49 @@ with st.sidebar:
         )
     elif module == "🗺️ 用地类型":
         st.header("🗺️ 用地模块")
-        landuse_viz_type = st.radio(
-            "可视化类型",
-            ["多边形地图", "点密度热力图", "KDE 热力图", "等值线图", "类别统计"],
+        st.subheader("选择指标")
+        landuse_indicator = st.radio(
+            "指标",
+            ["Shannon 熵", "绿地率", "混合用途（类型数）", "多边形地图"],
             index=0,
-            key="landuse_viz",
+            key="landuse_indicator",
         )
-        if landuse_viz_type in ("点密度热力图", "KDE 热力图", "等值线图"):
-            st.caption("基于用地 centroid 点")
+        landuse_indicator_map = {
+            "Shannon 熵": "shannon",
+            "绿地率": "green_rate",
+            "混合用途（类型数）": "n_types",
+        }
+        if landuse_indicator != "多边形地图":
+            st.subheader("可视化类型")
+            landuse_viz_type = st.radio(
+                "可视化类型",
+                [
+                    "单指标散点图",
+                    "单指标热力图",
+                    "双变量对比",
+                    "KDE 热力图",
+                    "等值线图",
+                    "点选雷达图分析区域",
+                    "类别统计",
+                ],
+                index=0,
+                key="landuse_viz",
+            )
+            if landuse_viz_type == "双变量对比":
+                landuse_indicator2 = st.selectbox(
+                    "指标 2",
+                    ["Shannon 熵", "绿地率", "混合用途（类型数）"],
+                    key="landuse_ind2",
+                )
+            st.divider()
+            st.subheader("雷达图")
+            landuse_radar_indicators = st.multiselect(
+                "雷达图指标",
+                ["shannon", "green_rate", "n_types"],
+                default=["shannon", "green_rate", "n_types"],
+                format_func=lambda x: {"shannon": "Shannon 熵", "green_rate": "绿地率", "n_types": "混合用途"}[x],
+                key="landuse_radar",
+            )
         st.caption("数据来自 OSM，需先运行 python fetch_landuse.py 拉取")
     elif module == "🛣️ 路网":
         st.header("🛣️ 路网模块")
@@ -490,7 +562,33 @@ with st.sidebar:
             "限速 (maxspeed)": "maxspeed",
             "路段长度 (length)": "length",
         }
+        road_max_edges = st.select_slider(
+            "地图显示边数（分级渲染，减少卡顿）",
+            options=[100, 300, 500, 1000, 2000, 0],
+            value=500,
+            format_func=lambda x: f"{x}" if x > 0 else "全部",
+            key="road_max_edges",
+        )
+        road_max_edges = None if road_max_edges == 0 else road_max_edges
         st.caption("数据来自 road/xujiahui_walk.graphml，需先运行 python fetch_road_network.py")
+    elif module == "🔧 适老化改造优先级":
+        st.header("🔧 CLD 改造优先级")
+        st.caption("基于街景、POI、用地、人口、路网，计算人机共生适老化改造优先路段")
+        cld_map_edges = st.select_slider(
+            "地图显示边数（分级渲染）",
+            options=[100, 300, 500, 1000, 2000, 0],
+            value=500,
+            format_func=lambda x: f"{x}" if x > 0 else "全部",
+            key="cld_map_edges",
+        )
+        cld_run_clicked = st.button("🔄 计算改造优先级", type="primary", use_container_width=True, key="cld_run_btn")
+        if cld_run_clicked:
+            if "cld_result" in st.session_state:
+                del st.session_state["cld_result"]
+            st.session_state["cld_run_requested"] = True
+    elif module == "📐 CLD 回路":
+        st.header("📐 系统动力学")
+        st.caption("适老化空间因果回路图（CLD）结构说明")
     st.markdown("---")
 
 # ==================== 主内容区 ====================
@@ -1042,78 +1140,166 @@ elif module == "🏠 房价小区":
 
 # ==================== 用地类型主逻辑 ====================
 elif module == "🗺️ 用地类型":
-    landuse_viz_type = st.session_state.get("landuse_viz", "多边形地图")
+    landuse_indicator = st.session_state.get("landuse_indicator", "Shannon 熵")
+    landuse_viz_type = st.session_state.get("landuse_viz", "单指标散点图") if landuse_indicator != "多边形地图" else None
+    landuse_indicator_map = {
+        "Shannon 熵": "shannon",
+        "绿地率": "green_rate",
+        "混合用途（类型数）": "n_types",
+    }
+    ind_col = landuse_indicator_map.get(landuse_indicator)
+
     gdf_landuse, centroid_df = cached_load_landuse()
+    landuse_grid_df = cached_landuse_grid_metrics(LANDUSE_DIR) if gdf_landuse is not None else None
 
     if gdf_landuse is None and centroid_df is None:
         st.warning("用地数据不存在")
         st.info("请先运行 `python fetch_landuse.py` 从 OSM 拉取徐家汇用地数据，将生成 landuse_data/ 目录。")
     else:
         landuse_stats = get_landuse_stats(gdf_landuse, centroid_df)
+        adv_metrics = compute_landuse_advanced_metrics(gdf_landuse) if gdf_landuse is not None else {}
 
         with st.container():
             st.markdown('<div class="module-card module-card-landuse">', unsafe_allow_html=True)
-            st.subheader("🗺️ 徐家汇用地类型")
-            st.caption("OSM landuse/leisure/natural · WGS84 · 无需纠偏")
-            c1, c2, c3 = st.columns(3)
+            st.subheader("🗺️ 徐家汇用地类型 · 高级指标")
+            st.caption("250m 网格 · Shannon 熵 · 绿地率 · 混合用途 · 与街景模块同构")
+            c1, c2, c3, c4, c5 = st.columns(5)
             with c1:
-                st.metric("多边形数", f"{landuse_stats['polygon_count']:,}")
+                st.metric("网格点数", f"{len(landuse_grid_df):,}" if landuse_grid_df is not None and len(landuse_grid_df) > 0 else "0")
             with c2:
-                st.metric("Centroid 点数", f"{landuse_stats['centroid_count']:,}")
+                st.metric("多边形数", f"{landuse_stats['polygon_count']:,}")
             with c3:
-                st.metric("可视化类型", landuse_viz_type)
+                st.metric("Shannon 熵（全域）", f"{adv_metrics.get('shannon_entropy', 0):.4f}")
+            with c4:
+                st.metric("绿地率（全域）", f"{adv_metrics.get('green_space_rate_pct', 0)}%")
+            with c5:
+                st.metric("混合用途比例（全域）", f"{adv_metrics.get('mixed_use_ratio_pct', 0)}%")
             st.markdown("</div>", unsafe_allow_html=True)
 
+        if landuse_indicator:
+            st.markdown(
+                f'<p class="indicator-caption"><b>{landuse_indicator}</b></p>',
+                unsafe_allow_html=True,
+            )
+
         m_landuse = None
+        map_fig_landuse = None
+        invert_landuse = ind_col == "green_rate" if ind_col else False
+
         try:
-            if landuse_viz_type == "多边形地图" and gdf_landuse is not None and len(gdf_landuse) > 0:
+            if landuse_indicator == "多边形地图" and gdf_landuse is not None and len(gdf_landuse) > 0:
                 m_landuse = create_landuse_map(
                     gdf_landuse,
                     map_center=MAP_CENTER,
                     map_zoom=MAP_ZOOM,
                 )
-            elif landuse_viz_type in ("点密度热力图", "KDE 热力图", "等值线图") and centroid_df is not None and len(centroid_df) > 0:
-                centroid_viz = prepare_landuse_for_viz(centroid_df)
-                if landuse_viz_type == "点密度热力图":
-                    m_landuse = create_heatmap(
-                        centroid_viz, "density",
-                        title="用地 centroid 密度热力图",
-                    )
-                elif landuse_viz_type == "KDE 热力图":
-                    m_landuse = create_kde_heatmap(
-                        centroid_viz, "density",
-                        map_center=MAP_CENTER, map_zoom=MAP_ZOOM,
-                        cmap_name="YlGn", invert_colors=False,
-                    )
-                elif landuse_viz_type == "等值线图":
-                    m_landuse = create_contour_map(
-                        centroid_viz, "density",
-                        map_center=MAP_CENTER, map_zoom=MAP_ZOOM,
-                        cmap_name="YlGn", invert_colors=False,
-                    )
+            elif landuse_viz_type in ("单指标散点图", "单指标热力图", "KDE 热力图", "等值线图", "双变量对比", "点选雷达图分析区域"):
+                if landuse_grid_df is None or len(landuse_grid_df) == 0:
+                    st.warning("网格指标数据为空，请确保用地 GeoJSON 存在。")
+                elif ind_col not in landuse_grid_df.columns:
+                    st.warning(f"指标 {ind_col} 不存在于数据中。")
+                else:
+                    df_landuse = landuse_grid_df
+                    if landuse_viz_type == "单指标散点图":
+                        m_landuse = create_point_map(df_landuse, ind_col, invert=invert_landuse)
+                    elif landuse_viz_type == "单指标热力图":
+                        m_landuse = create_heatmap(df_landuse, ind_col)
+                    elif landuse_viz_type == "KDE 热力图":
+                        m_landuse = create_kde_heatmap(
+                            df_landuse, ind_col,
+                            map_center=MAP_CENTER, map_zoom=MAP_ZOOM,
+                            invert_colors=invert_landuse,
+                        )
+                    elif landuse_viz_type == "等值线图":
+                        m_landuse = create_contour_map(
+                            df_landuse, ind_col,
+                            map_center=MAP_CENTER, map_zoom=MAP_ZOOM,
+                            invert_colors=invert_landuse,
+                        )
+                    elif landuse_viz_type == "双变量对比":
+                        ind2 = landuse_indicator_map.get(
+                            st.session_state.get("landuse_ind2", "绿地率"),
+                            "green_rate",
+                        )
+                        if ind2 != ind_col and ind2 in df_landuse.columns:
+                            m_landuse = create_bivariate_map(df_landuse, ind_col, ind2)
+                        else:
+                            st.warning("请选择不同的指标进行双变量对比")
+                    elif landuse_viz_type == "点选雷达图分析区域":
+                        map_fig_landuse = create_clickable_map(
+                            df_landuse, ind_col,
+                            map_center=MAP_CENTER, map_zoom=MAP_ZOOM,
+                            invert_colors=invert_landuse,
+                        )
+            elif landuse_viz_type == "类别统计" and centroid_df is not None and "landuse_type" in centroid_df.columns:
+                type_counts = centroid_df["landuse_type"].value_counts()
+                import plotly.express as px
+                fig = px.bar(
+                    x=type_counts.index,
+                    y=type_counts.values,
+                    labels={"x": "用地类型", "y": "数量"},
+                    title="用地类型分布",
+                )
+                st.plotly_chart(fig, use_container_width=True)
         except Exception as e:
             st.error(f"生成地图时出错: {e}")
 
-        if landuse_viz_type == "类别统计" and centroid_df is not None and "landuse_type" in centroid_df.columns:
-            type_counts = centroid_df["landuse_type"].value_counts()
-            import plotly.express as px
-            fig = px.bar(
-                x=type_counts.index,
-                y=type_counts.values,
-                labels={"x": "用地类型", "y": "数量"},
-                title="用地类型分布",
-            )
-            st.plotly_chart(fig, use_container_width=True)
-        elif m_landuse:
-            try:
-                from streamlit_folium import folium_static
-                folium_static(m_landuse, width=1100, height=600)
-            except ImportError:
-                import streamlit.components.v1 as components
-                components.html(m_landuse._repr_html_(), height=600, scrolling=True)
+        col_map_landuse, col_radar_landuse = st.columns([1.5, 1])
+        map_click_landuse = None
+
+        with col_map_landuse:
+            if map_fig_landuse is not None:
+                map_click_landuse = st.plotly_chart(
+                    map_fig_landuse, key="map_click_landuse", on_select="rerun", selection_mode="points", use_container_width=True
+                )
+                st.caption("👆 点击地图上的点可更新右侧雷达图")
+            elif m_landuse:
+                try:
+                    from streamlit_folium import folium_static
+                    folium_static(m_landuse, width=1100, height=600)
+                except ImportError:
+                    import streamlit.components.v1 as components
+                    components.html(m_landuse._repr_html_(), height=600, scrolling=True)
+            elif landuse_viz_type != "类别统计" and landuse_indicator != "多边形地图":
+                st.warning("无法生成地图")
+
+        with col_radar_landuse:
+            radar_inds = st.session_state.get("landuse_radar", ["shannon", "green_rate", "n_types"])
+            if landuse_indicator != "多边形地图" and landuse_grid_df is not None and len(landuse_grid_df) > 0 and radar_inds and len(radar_inds) >= 2:
+                with st.expander("📊 雷达图", expanded=True):
+                    row_idx = None
+                    if map_fig_landuse and map_click_landuse:
+                        sel = getattr(map_click_landuse, "selection", None) or (map_click_landuse.get("selection") if isinstance(map_click_landuse, dict) else None)
+                        if sel:
+                            idx = getattr(sel, "point_indices", None) or (sel.get("point_indices") or [])
+                            if idx and 0 <= idx[0] < len(landuse_grid_df):
+                                row_idx = idx[0]
+                    valid_radar = [c for c in radar_inds if c in landuse_grid_df.columns]
+                    if len(valid_radar) >= 2:
+                        if row_idx is not None:
+                            row = landuse_grid_df.iloc[row_idx]
+                            radar_fig = create_radar_chart(
+                                landuse_grid_df, valid_radar,
+                                title=f"网格 (经 {row['lon']:.4f}, 纬 {row['lat']:.4f})",
+                                row_index=row_idx,
+                            )
+                        else:
+                            radar_fig = create_radar_chart(
+                                landuse_grid_df, valid_radar,
+                                title="区域聚合",
+                                aggregation="mean",
+                            )
+                        if radar_fig:
+                            st.plotly_chart(radar_fig, use_container_width=True)
+                    else:
+                        st.caption("请选择至少 2 个雷达图指标")
+            elif landuse_indicator != "多边形地图" and landuse_viz_type in ("单指标散点图", "单指标热力图", "KDE 热力图", "等值线图", "点选雷达图分析区域"):
+                st.caption("雷达图需至少 2 个指标")
 
         with st.expander("📋 数据预览"):
-            if centroid_df is not None and len(centroid_df) > 0:
+            if landuse_grid_df is not None and len(landuse_grid_df) > 0:
+                st.dataframe(landuse_grid_df.head(100), use_container_width=True)
+            elif centroid_df is not None and len(centroid_df) > 0:
                 st.dataframe(centroid_df.head(100), use_container_width=True)
             elif gdf_landuse is not None and len(gdf_landuse) > 0:
                 st.dataframe(gdf_landuse.drop(columns=["geometry"], errors="ignore").head(50), use_container_width=True)
@@ -1165,11 +1351,14 @@ elif module == "🛣️ 路网":
         with r2:
             st.metric("lanes 数据覆盖率", f"{stats.get('lanes_coverage_pct', 0)}%")
 
+        road_max_edges_val = st.session_state.get("road_max_edges", 500)
+        road_max_edges_param = None if road_max_edges_val == 0 else road_max_edges_val
         m_road = create_road_map(
             G_road,
             map_center=tuple(MAP_CENTER),
             map_zoom=MAP_ZOOM,
             viz_mode=viz_mode,
+            max_edges=road_max_edges_param,
         )
         if m_road:
             try:
@@ -1205,3 +1394,116 @@ elif module == "🛣️ 路网":
                 if "lanes" in edges_road.columns:
                     preview_cols.append("lanes")
                 st.dataframe(edges_road[[c for c in preview_cols if c in edges_road.columns]].head(50), use_container_width=True)
+
+# ==================== 适老化改造优先级主逻辑 ====================
+elif module == "🔧 适老化改造优先级":
+    need_compute = st.session_state.get("cld_run_requested", False)
+    has_result = "cld_result" in st.session_state
+
+    if need_compute:
+        # 用户点击了「重新计算」：执行流水线并缓存
+        progress_bar = st.progress(0, text="准备中...")
+        status_placeholder = st.empty()
+
+        def on_progress(step: int, total: int, msg: str):
+            progress_bar.progress((step + 1) / total, text=msg)
+            status_placeholder.caption(f"步骤 {step + 1}/{total}: {msg}")
+
+        try:
+            landuse_df = cached_landuse_grid_metrics(LANDUSE_DIR)
+            G_cld, df_prio = run_cld_pipeline(
+                road_dir=ROAD_DIR,
+                streetview_csv_path=DATA_DIR / "merged.csv",
+                poi_csv_path=POI_DIR / "poi_all.csv",
+                landuse_grid_df=landuse_df,
+                population_dir=POPULATION_DIR,
+                progress_callback=on_progress,
+            )
+            st.session_state["cld_result"] = (G_cld, df_prio)
+            st.session_state["cld_run_requested"] = False
+            st.session_state["cld_from_cache"] = False
+            _save_cld_cache(G_cld, df_prio)
+            progress_bar.progress(1.0, text="完成")
+            status_placeholder.empty()
+        except Exception as e:
+            st.error(f"计算失败: {e}")
+            st.exception(e)
+            progress_bar.empty()
+            status_placeholder.empty()
+    elif not has_result:
+        # 首次进入：尝试从本地缓存加载
+        cached = _load_cld_cache()
+        if cached is not None:
+            G_cld, df_prio = cached
+            st.session_state["cld_result"] = (G_cld, df_prio)
+            st.session_state["cld_from_cache"] = True
+
+    cld_result = st.session_state.get("cld_result")
+    if cld_result is None:
+        st.info("👈 点击侧边栏「计算改造优先级」开始分析")
+    else:
+        G_cld, df_prio = cld_result
+        if G_cld is None:
+            st.warning("路网数据不存在，请先运行 fetch_road_network.py")
+        else:
+            st.subheader("🔧 徐汇区适老化改造优先路段")
+            cap = "按百分位着色：深红=Top10% 红=75-90% 橙=50-75% 黄=25-50% 绿=10-25% 灰=Bottom10%（优先改造红色路段）"
+            if st.session_state.get("cld_from_cache", False):
+                cap += " · 已从缓存加载，点击侧边栏「计算改造优先级」可重新计算"
+            st.caption(cap)
+            cld_map_edges_val = st.session_state.get("cld_map_edges", 500)
+            cld_max_edges = None if cld_map_edges_val == 0 else cld_map_edges_val
+            m_cld = create_road_map(
+                G_cld,
+                map_center=(31.19, 121.44),
+                map_zoom=14,
+                viz_mode="priority",
+                weight=3,
+                opacity=0.9,
+                max_edges=cld_max_edges,
+            )
+            if m_cld:
+                try:
+                    from streamlit_folium import folium_static
+                    folium_static(m_cld, width=1100, height=600)
+                except Exception:
+                    import streamlit.components.v1 as components
+                    components.html(m_cld._repr_html_(), height=600, scrolling=True)
+
+            if df_prio is not None and len(df_prio) > 0:
+                top_n = st.slider("显示 Top 优先边数", 10, 100, 30, key="cld_top_n")
+                df_top = df_prio.nlargest(top_n, "priority")
+                st.dataframe(
+                    df_top[["u", "v", "lon", "lat", "N02", "N15", "N17", "priority"]].round(3),
+                    use_container_width=True,
+                )
+
+# ==================== CLD 回路主逻辑 ====================
+elif module == "📐 CLD 回路":
+    from analysis.cld_viz import create_cld_figure
+
+    st.subheader("适老化空间系统 · 因果回路图")
+    intro = """
+    **系统有 4 条正向强化回路（越做越好）、3 条平衡回路（自动刹车）、1 条恶性强化回路（需人工干预）。**
+
+    | 类型 | 回路 | 含义 |
+    |------|------|------|
+    | 强化 R | R1 社交活力 | 场所多→老人来→街道热闹→场所更多 |
+    | 强化 R | R4 认知恢复 | 空间有挑战→激活认知→愿意探索→空间更丰富 |
+    | 强化 R | R5 人机共生 | 部署装置→产生数据→优化装置→更好部署 |
+    | 平衡 B | B2 拥挤调节 | 人太多→舒适度下降→不再扎堆 |
+    | 平衡 B | B3 认知超载 | 太复杂→压力大→不愿探索 |
+    | 平衡 B | B4 干预疲劳 | 装置太多→用腻了→数据变少 |
+    | 恶性 R | R_bad 交通诱导 | 车多→噪声大→不愿步行→更多人开车→车更多（需人机干预破解） |
+    """
+    st.markdown(intro)
+    st.divider()
+
+    fig_cld = create_cld_figure()
+    if fig_cld:
+        st.plotly_chart(fig_cld, use_container_width=True)
+    else:
+        st.warning("需安装 plotly 以显示 CLD 图")
+
+    with st.expander("📄 完整说明"):
+        st.markdown("详见 [CLD回路简介](docs/CLD回路简介.md) 与 [cld_balance_analysis](docs/cld_balance_analysis.md)")

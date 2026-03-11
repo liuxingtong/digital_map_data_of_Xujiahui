@@ -16,6 +16,11 @@ from .loader import (
 )
 from .overlay import create_landuse_map
 from .fetcher import fetch_landuse, run_fetch, save_landuse
+from .metrics import (
+    compute_landuse_advanced_metrics,
+    compute_landuse_grid_metrics,
+    compute_grid_shannon_entropy,
+)
 
 __all__ = [
     "load_landuse",
@@ -27,6 +32,9 @@ __all__ = [
     "fetch_landuse",
     "run_fetch",
     "save_landuse",
+    "compute_landuse_advanced_metrics",
+    "compute_landuse_grid_metrics",
+    "compute_grid_shannon_entropy",
     "LANDUSE_LABELS",
     "XUJIAHUI_BOUNDS",
 ]
