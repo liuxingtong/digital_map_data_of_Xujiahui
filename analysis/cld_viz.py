@@ -29,9 +29,13 @@ NODE_INFO = {
     "N15": ("认知激活", "认知储备激活潜力", "数据可算"),
     "N16": ("探索意愿", "主动探索意愿", "仿真内生"),
     "N17": ("生理压力", "环境生理压力", "数据可算"),
-    "N18": ("人机干预", "人机共生干预", "设计变量"),
+    "N18": ("人机干预", "N_YP→代际接触的转换器", "设计变量"),
     "N19": ("行为数据", "行为数据密度", "仿真内生"),
     "N20": ("干预优化", "干预节点优化", "仿真内生"),
+    # R6 代际激活链 · 画像节点
+    "N_YP": ("年轻人在场", "潜在认知资源·适度陌生来源", "外生变量"),
+    "N_IG": ("代际互动", "两群人同时空做同一事的时刻", "仿真内生"),
+    "N_GC": ("隔代照料", "隔代照料强度", "数据可算"),
 }
 
 # 边：(起点, 终点, 极性, 所属回路, 回路类型)
@@ -60,19 +64,43 @@ EDGES = [
     ("N14", "N17", "+", "B3", "B"),
     ("N17", "N15", "-", "B3", "B"),
     ("N18", "N19", "-", "B4", "B"),
+    # R6 代际激活链：N_YP/N18 → N_IG → N15，向 R4 注入
+    ("N_YP", "N_IG", "+", "R6", "R"),
+    ("N_IG", "N15", "+", "R6", "R"),
+    ("N18", "N_IG", "+", "R6", "R"),
+    # E44：N_YP 向 N14 注入（适度陌生：新行为模式、不同空间使用、意外视觉刺激）
+    ("N_YP", "N14", "+", "R6", "R"),
+    # R_bad 外部输入：年轻人通勤强化车流
+    ("N_YP", "N10", "+", "R_bad", "R_bad"),
+    # B5 文化摩擦：年轻人在场降低老年人舒适感
+    ("N_YP", "N09", "-", "B5", "B"),
+    # N_YP 支撑街道活跃度
+    ("N_YP", "N03", "+", "R6", "R"),
+    # N_GC 隔代照料：聚集+、探索-、驱动干预
+    ("N_GC", "N02", "+", "R6", "R"),
+    ("N_GC", "N16", "-", "B6", "B"),
+    ("N_GC", "N18", "+", "R6", "R"),
+    # N18 转换器：向 R4 注入、削弱 R_bad/B3
+    ("N18", "N14", "+", "R6", "R"),
+    ("N18", "N17", "-", "cross", "B"),
+    ("N18", "N10", "-", "cross", "B"),
 ]
 
-# 回路元信息
+# 跨层边（N18 转换器对 R_bad/B3 的干预）
 LOOP_META = {
+    "cross": ("跨层干预", "cross", "N18 削弱 R_bad/B3"),
     "R1": ("社交活力", "R", "正向强化"),
     "R2": ("步行可达", "R", "注入链"),
     "R3": ("环境舒适", "R", "注入链"),
     "R4": ("认知恢复", "R", "正向强化"),
     "R5": ("人机共生", "R", "正向强化"),
+    "R6": ("代际激活", "R", "注入链"),
     "R_bad": ("交通诱导", "R_bad", "恶性强化"),
     "B2": ("拥挤调节", "B", "平衡回路"),
     "B3": ("认知超载", "B", "平衡回路"),
     "B4": ("干预疲劳", "B", "平衡回路"),
+    "B5": ("文化摩擦", "B", "抑制链"),
+    "B6": ("隔代锁定", "B", "抑制链"),
 }
 
 # 颜色：按回路类型
@@ -82,15 +110,19 @@ COLOR_R_BAD = "#dc2626"  # 红 - 恶性
 COLOR_INJECT = "#84cc16" # 黄绿 - 注入链
 
 LOOP_COLORS = {
+    "cross": "#64748b",
     "R1": COLOR_R,
     "R2": COLOR_INJECT,
     "R3": COLOR_INJECT,
     "R4": "#3b82f6",     # 蓝
     "R5": "#8b5cf6",     # 紫
+    "R6": "#fbbf24",     # 黄 - 代际激活
     "R_bad": COLOR_R_BAD,
     "B2": COLOR_B,
     "B3": COLOR_B,
     "B4": COLOR_B,
+    "B5": COLOR_B,
+    "B6": COLOR_B,
 }
 
 # 节点按类型着色
@@ -98,6 +130,7 @@ NODE_TYPE_COLORS = {
     "数据可算": "#e0f2fe",
     "仿真内生": "#fef3c7",
     "设计变量": "#ddd6fe",
+    "外生变量": "#fed7aa",
 }
 
 
@@ -132,6 +165,10 @@ def create_cld_figure() -> "plotly.graph_objects.Figure | None":
         "N07": (-0.6, 1.7),
         "N09": (0.2, 1.3),
         "N17": (1.4, 0.7),
+        # R6 画像节点
+        "N_YP": (-1.2, -1.8),
+        "N_IG": (0.8, -0.8),
+        "N_GC": (-0.4, 1.0),
     }
     for n in nodes:
         if n not in pos:
@@ -144,7 +181,11 @@ def create_cld_figure() -> "plotly.graph_objects.Figure | None":
         return info[0], info[1], info[2]
 
     node_colors = [NODE_TYPE_COLORS.get(_node_info(n)[2], "#f1f5f9") for n in nodes]
-    node_border = ["#0ea5e9" if _node_info(n)[2] == "设计变量" else "#64748b" for n in nodes]
+    def _border(t):
+        if t == "设计变量": return "#0ea5e9"
+        if t == "外生变量": return "#ea580c"
+        return "#64748b"
+    node_border = [_border(_node_info(n)[2]) for n in nodes]
     hover_texts = [f"<b>{n}</b> {_node_info(n)[1]}<br>类型: {_node_info(n)[2]}" for n in nodes]
 
     # 节点
@@ -218,7 +259,7 @@ def create_cld_figure() -> "plotly.graph_objects.Figure | None":
     fig = go.Figure(data=[node_trace])
     fig.update_layout(
         title=dict(
-            text="适老化空间 CLD 因果回路图",
+            text="适老化空间 CLD · 徐家汇代际认知恢复",
             font=dict(size=18),
         ),
         showlegend=False,
@@ -234,16 +275,20 @@ def create_cld_figure() -> "plotly.graph_objects.Figure | None":
 
     # 图例区
     legend_items = [
+        "<b>统一叙事</b> 两群人+一堵墙 → N18把墙变成门 → 年轻人流动=认知恢复能量",
+        "",
         "<b>回路类型</b>",
         "🟢 <b>R</b> 正向强化 (R1/R4/R5)",
-        "🟡 <b>注入链</b> (R2/R3)",
+        "🟡 <b>R6</b> 代际激活·向R4注入 (N_YP经N18→N_IG→N15)",
         "🔴 <b>R_bad</b> 恶性强化 (交通诱导)",
-        "🔵 <b>B</b> 平衡回路 (B2/B3/B4)",
+        "🔵 <b>B</b> 平衡回路 (B2/B3/B4/B5/B6)",
+        "⚫ <b>cross</b> N18削弱R_bad/B3",
+        "",
+        "<b>N18 转换器</b> 制造代际接触时刻；R5=优化触发效率",
+        "<b>N_YP</b> 潜在认知资源；N_IG 需N18调节才能充分实现",
         "",
         "<b>边极性</b> (+) 正向  (-) 负向",
-        "<b>线型</b> 实线=+  虚线=-",
-        "",
-        "<b>节点类型</b> 浅蓝=数据可算 浅黄=仿真内生 浅紫=设计变量",
+        "<b>节点类型</b> 浅蓝=数据可算 浅黄=仿真内生 浅紫=设计变量 浅橙=外生",
     ]
     fig.add_annotation(
         text="<br>".join(legend_items),

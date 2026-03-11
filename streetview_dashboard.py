@@ -364,7 +364,7 @@ st.markdown(
 # ==================== 模块选择 ====================
 module = st.radio(
     "当前模块",
-    ["📊 街景指标", "👥 人口分布", "📍 POI 分布", "🏠 房价小区", "🗺️ 用地类型", "🛣️ 路网", "🔧 适老化改造优先级", "📐 CLD 回路"],
+    ["📊 街景指标", "👥 人口分布", "📍 POI 分布", "🏠 房价小区", "🗺️ 用地类型", "🛣️ 路网", "🔧 适老化改造优先级", "📐 CLD 回路", "📈 SD 仿真"],
     horizontal=True,
     key="module",
 )
@@ -589,6 +589,9 @@ with st.sidebar:
     elif module == "📐 CLD 回路":
         st.header("📐 系统动力学")
         st.caption("适老化空间因果回路图（CLD）结构说明")
+    elif module == "📈 SD 仿真":
+        st.header("📈 SD 仿真")
+        st.caption("不同 N18 干预强度下 N15/N_IG/N16 的时间演化")
     st.markdown("---")
 
 # ==================== 主内容区 ====================
@@ -1491,6 +1494,7 @@ elif module == "📐 CLD 回路":
     | 强化 R | R1 社交活力 | 场所多→老人来→街道热闹→场所更多 |
     | 强化 R | R4 认知恢复 | 空间有挑战→激活认知→愿意探索→空间更丰富 |
     | 强化 R | R5 人机共生 | 部署装置→产生数据→优化装置→更好部署 |
+    | 注入链 | R6 代际激活 | N_YP+N18→N_IG→N15（向R4注入）；N18 把墙变成门 |
     | 平衡 B | B2 拥挤调节 | 人太多→舒适度下降→不再扎堆 |
     | 平衡 B | B3 认知超载 | 太复杂→压力大→不愿探索 |
     | 平衡 B | B4 干预疲劳 | 装置太多→用腻了→数据变少 |
@@ -1507,3 +1511,81 @@ elif module == "📐 CLD 回路":
 
     with st.expander("📄 完整说明"):
         st.markdown("详见 [CLD回路简介](docs/CLD回路简介.md) 与 [cld_balance_analysis](docs/cld_balance_analysis.md)")
+
+# ==================== SD 仿真主逻辑 ====================
+elif module == "📈 SD 仿真":
+    from analysis.sd import (
+        SDInitialValues,
+        aggregate_from_priority_df,
+        run_sd_scenarios,
+        DEFAULT_PARAMS,
+    )
+
+    st.subheader("系统动力学仿真 · N18 转换器效应")
+    st.caption("按 [CLD_SD_可行性说明](docs/CLD_SD_可行性说明.md)：N18 把 N_YP 从威胁转化为代际接触触发点")
+
+    # 初始值来源
+    t0: SDInitialValues | None = None
+    cld_result = st.session_state.get("cld_result")
+    if cld_result is not None:
+        _, df_prio = cld_result
+        if df_prio is not None and len(df_prio) > 0:
+            top_k = st.slider("聚合 Top 优先边数", 10, 100, 50, key="sd_top_k")
+            t0 = aggregate_from_priority_df(df_prio, top_k=top_k)
+            st.success(f"已从改造优先级 Top {top_k} 边聚合初始值")
+    if t0 is None:
+        t0 = SDInitialValues()
+        st.info("未检测到 CLD 改造优先级结果，使用默认初始值。可先运行「适老化改造优先级」模块")
+
+    # 仿真参数
+    col1, col2 = st.columns(2)
+    with col1:
+        months = st.slider("仿真月数", 6, 36, 24, key="sd_months")
+        n18_levels = st.multiselect(
+            "N18 干预档位",
+            [0.0, 0.3, 0.6, 1.0],
+            default=[0.0, 0.3, 0.6, 1.0],
+            format_func=lambda x: f"N18={x:.1f}",
+            key="sd_n18",
+        )
+    with col2:
+        alpha = st.number_input("α (N18 放大 N_YP→N_IG)", 0.5, 5.0, 2.0, 0.1, key="sd_alpha")
+        beta = st.number_input("β (N_IG→N15 注入)", 0.05, 0.5, 0.15, 0.01, key="sd_beta")
+
+    if not n18_levels:
+        n18_levels = [0.0]
+
+    run_sd = st.button("🔄 运行 SD 仿真", type="primary", key="sd_run")
+    if run_sd or "sd_result" not in st.session_state:
+        with st.spinner("仿真中..."):
+            df_sd = run_sd_scenarios(
+                t0,
+                N18_levels=n18_levels,
+                months=months,
+                params={"alpha": alpha, "beta": beta},
+            )
+        st.session_state["sd_result"] = df_sd
+
+    df_sd = st.session_state.get("sd_result")
+    if df_sd is not None and len(df_sd) > 0:
+        try:
+            import plotly.express as px
+            import plotly.graph_objects as go
+            from plotly.subplots import make_subplots
+
+            metrics = ["N15", "N_IG", "N16"]
+            fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+                subplot_titles=["N15 认知储备激活", "N_IG 代际互动", "N16 探索意愿"])
+            for i, m in enumerate(metrics):
+                for scen in df_sd["scenario"].unique():
+                    sub = df_sd[df_sd["scenario"] == scen]
+                    fig.add_trace(
+                        go.Scatter(x=sub["month"], y=sub[m], name=scen, legendgroup=scen, showlegend=(i == 0)),
+                        row=i + 1, col=1,
+                    )
+            fig.update_layout(height=500, title="不同 N18 档位下的时间演化")
+            st.plotly_chart(fig, use_container_width=True)
+        except ImportError:
+            st.dataframe(df_sd, use_container_width=True)
+        with st.expander("📋 仿真数据（最后 20 步）"):
+            st.dataframe(df_sd.tail(20), use_container_width=True)
